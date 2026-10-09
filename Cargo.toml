@@ -1,0 +1,26 @@
+[package]
+name = "codec-bench"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+
+[features]
+patched = []
+alloc-diagnostics = []
+codec-diagnostics = ["redis/bench-codec-diag"]
+jemalloc = ["dep:tikv-jemallocator"]
+
+[dependencies]
+redis = { path = "vendor/upstream/redis", default-features = false, features = ["tokio-comp"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hdrhistogram = "7"
+libc = "0.2"
+tikv-jemallocator = { version = "0.6", optional = true }
+
+[profile.release]
+debug = 1
+
+[workspace]
+exclude = ["vendor/upstream", "vendor/upstream/redis"]
