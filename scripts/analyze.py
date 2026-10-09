@@ -85,7 +85,7 @@ def host_metrics(attempt, summary):
 
 def run_rows(summary, samples, attempt, build):
     cfg=summary['config']
-    base={k:cfg[k] for k in ['id','variant','connections','pipeline_batch','workload','duration_s','warmup_s','idle_s','workers','spike_mode']}
+    base={k:cfg[k] for k in ['id','variant','connections','pipeline_batch','workload','duration_s','warmup_s','idle_s','workers','spike_mode','seed']}
     base.update(source_commit=summary['build_commit'],binary_sha256=build['binary_sha256'],
                 inflight_limit=cfg['connections']*cfg['per_connection_inflight'],target_commands_s=cfg['rate'],
                 achieved_commands_s=summary['achieved_commands_s'],status=summary['status'],errors=summary['errors'],
@@ -115,17 +115,26 @@ def run_rows(summary, samples, attempt, build):
             rows.append(row)
     return rows
 
-def median_rows(rows):
+def aggregate_rows(rows, reducer, counts=False):
     grouped={}
     for row in rows: grouped.setdefault(tuple(row[d] for d in DIMENSIONS),[]).append(row)
     result=[]
     for key,runs in grouped.items():
         row=dict(zip(DIMENSIONS,key),repetitions=len(runs),limited_runs=sum(r['status']=='LIMITED' for r in runs))
-        for field in set().union(*(r.keys() for r in runs)):
+        for field in sorted(set().union(*(r.keys() for r in runs))):
+            if field in DIMENSIONS or field == 'seed': continue
             values=[r[field] for r in runs if isinstance(r.get(field),(int,float)) and not isinstance(r[field],bool)]
-            if field not in DIMENSIONS and values: row[field]=statistics.median(values)
+            if values:
+                row[field]=reducer(values)
+                if counts: row[field+'_runs']=len(values)
+            elif counts and all(r.get(field) is None for r in runs):
+                row[field]=None
+                row[field+'_runs']=0
         result.append(row)
     return result
+
+def median_rows(rows): return aggregate_rows(rows,statistics.median)
+def mean_rows(rows): return aggregate_rows(rows,statistics.mean,counts=True)
 
 def write_csv(path,rows):
     fields=list(dict.fromkeys(k for r in rows for k in r))
@@ -147,12 +156,17 @@ def main():
         rows.extend(run_rows(summary,samples,attempt,build));completed+=1
     if not rows: raise SystemExit('No validated completed runs')
     write_csv(args.results/'per_run.csv',rows);write_csv(args.results/'medians.csv',median_rows(rows))
+    write_csv(args.results/'means.csv',mean_rows(rows))
+    from reporting import markdown_report
+    for scope,name in [('aggregate','report.md'),('payload','payload_report.md')]:
+        (args.results/name).write_text(markdown_report(rows,completed,len(plan),plan=plan,scope=scope))
     print(f'Verified completed runs: {completed}/{len(plan)}; remaining: {len(plan)-completed}')
     print('CPU/RSS are whole-run metrics repeated for each latency group; do not sum them across groups.')
     print('CPU/command and all latencies use microseconds; RSS uses MiB. Unreportable p99.9 is blank.')
     print('RSS slopes are observations, not proof of a leak or steady state.')
     print('Host deltas cover their reported sample span; no server CPU/bottleneck attribution without server telemetry.')
-    print('Medians of run percentiles are not pooled percentiles. HDR files retain the distributions.')
-    print('CSV files:',args.results/'per_run.csv',args.results/'medians.csv')
+    print('Means and medians of run percentiles are not pooled percentiles. HDR files retain the distributions.')
+    print('Reports:',args.results/'report.md',args.results/'payload_report.md')
+    print('CSV files:',args.results/'per_run.csv',args.results/'means.csv',args.results/'medians.csv')
 
 if __name__=='__main__': main()

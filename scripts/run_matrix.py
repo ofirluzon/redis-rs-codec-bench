@@ -134,12 +134,12 @@ def main():
     build_path.write_text(json.dumps(builds,indent=2))
     # Retain the exact public kit and binaries once per matrix, alongside its private results.
     snapshot=args.results/'kit';snapshot.mkdir(exist_ok=True)
-    for directory in ['src','scripts']:
+    for directory in ['src','scripts','docs']:
         for path in (ROOT/directory).glob('*'):
-            if path.is_file() and path.suffix in ['.py','.rs','.sh']:
+            if path.is_file() and path.suffix in ['.py','.rs','.sh','.md']:
                 dest=snapshot/directory/path.name;dest.parent.mkdir(exist_ok=True)
                 if not dest.exists(): dest.write_bytes(path.read_bytes())
-    for name in ['Cargo.toml','Cargo.lock','rust-toolchain.toml','matrix.json']:
+    for name in ['Cargo.toml','Cargo.lock','rust-toolchain.toml','matrix.json','README.md']:
         if not (snapshot/name).exists(): (snapshot/name).write_bytes((ROOT/name).read_bytes())
     for name in builds:
         binary=ROOT/'bin'/(name+suffix);dest=snapshot/'bin';dest.mkdir(exist_ok=True)

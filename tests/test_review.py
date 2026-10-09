@@ -30,7 +30,7 @@ class MatrixReview(unittest.TestCase):
     def test_pipeline_controls_have_identical_budget(self):
         from make_plans import generate
         rows,_=generate(self.matrix,'pipeline-screening')
-        self.assertEqual(len(rows),48)
+        self.assertEqual(len(rows),144)
         for r in rows:
             self.assertEqual(r['connections']*r['per_connection_inflight'],64)
             control=[c for c in rows if all(c[k]==r[k] for k in ['connections','rate','workload','variant','seed']) and c['pipeline_batch']==1]
