@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Correctness check on an isolated loopback Redis. Never targets AWS."""
 import json
+import argparse
 import os
 from pathlib import Path
 import shutil
@@ -11,6 +12,9 @@ import time
 ROOT=Path(__file__).resolve().parents[1]
 
 def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--jemalloc',action='store_true')
+    args=parser.parse_args()
     server=shutil.which('redis-server')
     if not server:raise SystemExit('redis-server needed for local correctness check')
     with socket.socket() as sock:
@@ -31,21 +35,33 @@ def main():
                 for workload,connections,batch in [('small',1,1),('rare',4,1),('near',1,1),('large',1,4)]:
                     rows.append({'id':f'local-{variant}-{workload}-c{connections}-b{batch}',
                         'variant':variant,'workload':workload,'connections':connections,'per_connection_inflight':4,
-                        'rate':2000 if workload=='rare' else 50,'duration_s':2,'warmup_s':0,'idle_s':0,
+                        'rate':2000 if workload=='rare' else 51 if workload=='large' else 50,'duration_s':2,'warmup_s':0,'idle_s':0,
                         'workers':4,'pipeline_batch':batch,'seed':42,'spike_mode':'random'})
             plan=out/'local-plan.json';plan.write_text(json.dumps(rows,indent=2))
             scored=out/'scored'
-            command=['python3',str(ROOT/'scripts/run_matrix.py'),str(plan),'--results',str(scored),'--allow-non-linux']
+            command=['python3',str(ROOT/'scripts/run_matrix.py'),str(plan),'--results',str(scored),'--allow-non-linux','--server-info']
+            if args.jemalloc: command.append('--jemalloc')
             subprocess.run(command,check=True,env=env)
             # A repeated invocation must resume without adding attempts or mixing configurations.
             attempts_before=len(list(scored.glob('*/attempt-*')))
             subprocess.run(command,check=True,env=env)
             assert len(list(scored.glob('*/attempt-*')))==attempts_before
+            from server_info import collect
+            assert collect(env['REDIS_URL']).get('counters',{}).get('connected_clients',0)>0
+            for done in scored.glob('*/DONE.json'):
+                attempt=done.parent/json.loads(done.read_text())['attempt']
+                summary=json.loads((attempt/'summary.json').read_text())
+                assert summary['aggregate_groups']['all']['commands']==summary['completed']
+                if summary['config']['workload']=='large':
+                    assert summary['offered']==102
+                    assert summary['completed']==102, 'Tail pipeline command was lost in loopback'
+                assert summary['allocator']==('jemalloc' if args.jemalloc else 'system')
             subprocess.run(['python3',str(ROOT/'scripts/analyze.py'),str(scored)],check=True)
-            for diagnostic in [False,True]:
+            for diagnostic in ([False] if args.jemalloc else [False,True]):
                 for variant in ['baseline','patched-off','patched-on']:
                     binary='baseline' if variant=='baseline' else 'patched'
                     if diagnostic:binary+='-diagnostic'
+                    elif args.jemalloc:binary+='-jemalloc'
                     case={'id':f'probe-{variant}-{diagnostic}','variant':variant,'workload':'single-spike',
                         'connections':1,'per_connection_inflight':16,'rate':50,'duration_s':7,'warmup_s':0,
                         'idle_s':1,'workers':4,'pipeline_batch':1,'seed':42,'spike_mode':'random'}

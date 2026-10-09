@@ -1,0 +1,37 @@
+name: Harness correctness
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  linux-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install local Redis and Rust tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y redis-server
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
+      - name: Validate matrix and Python regressions
+        run: |
+          python3 -m unittest discover -s tests -v
+          python3 scripts/make_plans.py
+          git diff --exit-code -- plans
+      - name: Build matched scored and diagnostic sources
+        run: |
+          python3 scripts/build.py
+          python3 scripts/build.py --diagnostics
+          python3 scripts/build.py --jemalloc
+      - name: Rust checks
+        run: |
+          cargo fmt --package codec-bench --check
+          cargo test --locked --features patched,alloc-diagnostics,codec-diagnostics
+          cargo clippy --locked --features patched,alloc-diagnostics,codec-diagnostics -- -D warnings
+      - name: Loopback integration and Linux telemetry checks
+        run: |
+          python3 scripts/local_check.py
+          python3 scripts/local_check.py --jemalloc

@@ -40,6 +40,8 @@ mod allocation {
     pub static ALLOCS: AtomicU64 = AtomicU64::new(0);
     pub static FREES: AtomicU64 = AtomicU64::new(0);
     pub static REALLOCS: AtomicU64 = AtomicU64::new(0);
+    pub static ALLOCATED: AtomicU64 = AtomicU64::new(0);
+    pub static FREED: AtomicU64 = AtomicU64::new(0);
     fn add(n: usize) {
         let now = LIVE.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
         PEAK.fetch_max(now, Ordering::Relaxed);
@@ -49,6 +51,7 @@ mod allocation {
             let p = unsafe { System.alloc(layout) };
             if !p.is_null() {
                 add(layout.size());
+                ALLOCATED.fetch_add(layout.size() as u64, Ordering::Relaxed);
                 ALLOCS.fetch_add(1, Ordering::Relaxed);
             }
             p
@@ -57,6 +60,7 @@ mod allocation {
             let p = unsafe { System.alloc_zeroed(layout) };
             if !p.is_null() {
                 add(layout.size());
+                ALLOCATED.fetch_add(layout.size() as u64, Ordering::Relaxed);
                 ALLOCS.fetch_add(1, Ordering::Relaxed);
             }
             p
@@ -65,6 +69,7 @@ mod allocation {
             unsafe { System.dealloc(p, layout) };
             LIVE.fetch_sub(layout.size() as u64, Ordering::Relaxed);
             FREES.fetch_add(1, Ordering::Relaxed);
+            FREED.fetch_add(layout.size() as u64, Ordering::Relaxed);
         }
         unsafe fn realloc(&self, p: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
             let new_p = unsafe { System.realloc(p, layout, new_size) };
@@ -75,6 +80,8 @@ mod allocation {
                     LIVE.fetch_sub((layout.size() - new_size) as u64, Ordering::Relaxed);
                 }
                 REALLOCS.fetch_add(1, Ordering::Relaxed);
+                ALLOCATED.fetch_add(new_size as u64, Ordering::Relaxed);
+                FREED.fetch_add(layout.size() as u64, Ordering::Relaxed);
             }
             new_p
         }
@@ -85,6 +92,7 @@ mod allocation {
 static ALLOCATOR: allocation::Tracking = allocation::Tracking;
 
 #[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct Config {
     id: String,
     variant: String,
@@ -149,7 +157,7 @@ fn size_index(config: &Config, seq: u64, pool_len: usize) -> usize {
         } else if config.spike_mode == "synchronized" {
             (seq / config.connections as u64) % 1000 == 999
         } else {
-            mixed(seq ^ config.seed) % 1000 == 0
+            mixed(seq ^ config.seed).is_multiple_of(1000)
         };
         usize::from(large)
     } else {
@@ -278,6 +286,8 @@ struct Stats {
     errors: u64,
     offered: u64,
     not_submitted: u64,
+    capacity_skipped: u64,
+    deadline_skipped: u64,
     per_connection_large: Vec<u64>,
 }
 fn record(
@@ -325,13 +335,36 @@ fn record(
     Ok(())
 }
 
+fn due_batch(seq: u64, due: u64, maximum: u64, batch: usize) -> Option<usize> {
+    let count = (maximum.saturating_sub(seq)).min(batch as u64);
+    (count > 0 && seq.saturating_add(count) <= due).then_some(count as usize)
+}
+
+fn diagnostics() -> serde_json::Value {
+    #[allow(unused_mut)]
+    let mut result = json!({});
+    #[cfg(feature = "alloc-diagnostics")]
+    {
+        result["alloc"] = json!({"live_requested_bytes":allocation::LIVE.load(Ordering::Relaxed),
+        "peak_requested_bytes":allocation::PEAK.load(Ordering::Relaxed),
+        "allocations":allocation::ALLOCS.load(Ordering::Relaxed),"frees":allocation::FREES.load(Ordering::Relaxed),
+        "reallocations":allocation::REALLOCS.load(Ordering::Relaxed),
+        "allocated_requested_bytes":allocation::ALLOCATED.load(Ordering::Relaxed),
+        "freed_requested_bytes":allocation::FREED.load(Ordering::Relaxed)});
+    }
+    #[cfg(feature = "codec-diagnostics")]
+    {
+        result["codec"] = serde_json::to_value(redis::codec_bench_metrics::snapshot()).unwrap();
+    }
+    result
+}
+
 async fn phase(
     config: &Config,
     seconds: u64,
     conns: &[MultiplexedConnection],
     payloads: &[Arc<Vec<u8>>],
     gauges: Arc<Gauges>,
-    measured: bool,
     errors: &mut BufWriter<File>,
     epoch: Instant,
 ) -> Result<(Stats, f64), String> {
@@ -357,26 +390,28 @@ async fn phase(
     while Instant::now() < end {
         tokio::select! {
             _ = clock.tick() => {
-                let due = ((start.elapsed().as_secs_f64() * config.rate as f64) as u64).min(maximum);
+                let due = ((start.elapsed().as_secs_f64() * config.rate as f64) as u64).saturating_add(1).min(maximum);
                 // Bounded offered load: unavailable slots are counted, not accumulated in an unbounded queue.
-                while seq + config.pipeline_batch as u64 <= due && Instant::now() < end {
+                while let Some(batch_size) = due_batch(seq, due, maximum, config.pipeline_batch) {
+                    if Instant::now() >= end { break; }
                     let conn_index = ((seq / config.pipeline_batch as u64) % conns.len() as u64) as usize;
-                    stats.offered += config.pipeline_batch as u64;
-                    let Ok(permit) = permits[conn_index].clone().try_acquire_many_owned(config.pipeline_batch as u32) else {
-                        stats.not_submitted += config.pipeline_batch as u64;
-                        seq += config.pipeline_batch as u64;
+                    stats.offered += batch_size as u64;
+                    let Ok(permit) = permits[conn_index].clone().try_acquire_many_owned(batch_size as u32) else {
+                        stats.not_submitted += batch_size as u64;
+                        stats.capacity_skipped += batch_size as u64;
+                        seq += batch_size as u64;
                         continue;
                     };
-                    let mut batch = Vec::with_capacity(config.pipeline_batch);
-                    let mut scheduled = Vec::with_capacity(config.pipeline_batch);
-                    for i in 0..config.pipeline_batch as u64 {
+                    let mut batch = Vec::with_capacity(batch_size);
+                    let mut scheduled = Vec::with_capacity(batch_size);
+                    for i in 0..batch_size as u64 {
                         batch.push(payloads[size_index(config, seq+i, payloads.len())].clone());
                         scheduled.push(start + Duration::from_secs_f64((seq+i) as f64 / config.rate as f64));
                     }
                     let bytes = batch.iter().map(|p|p.len() as u64).sum();
-                    let flight = Flight::new(gauges.clone(), config.pipeline_batch as u64, bytes, permit);
+                    let flight = Flight::new(gauges.clone(), batch_size as u64, bytes, permit);
                     running.spawn(request(conns[conn_index].clone(), batch, scheduled, conn_index, flight));
-                    seq += config.pipeline_batch as u64;
+                    seq += batch_size as u64;
                 }
             }
             Some(result) = running.join_next(), if !running.is_empty() => {
@@ -386,7 +421,8 @@ async fn phase(
         }
     }
     // Explicit drain time. Commands started in the window belong to that window even if they finish later.
-    stats.not_submitted += maximum.saturating_sub(stats.offered);
+    stats.deadline_skipped = maximum.saturating_sub(stats.offered);
+    stats.not_submitted += stats.deadline_skipped;
     stats.offered = maximum;
     while let Some(result) = running.join_next().await {
         record(
@@ -397,9 +433,6 @@ async fn phase(
         )?;
     }
     let drain_s = Instant::now().saturating_duration_since(end).as_secs_f64();
-    if !measured {
-        stats.groups.clear();
-    }
     Ok((stats, drain_s))
 }
 
@@ -438,21 +471,14 @@ fn collector(
         let mut writer = BufWriter::new(File::create(out).unwrap());
         while !stop.load(Ordering::Relaxed) {
             let (user, system, peak) = usage();
-            let sample = json!({"elapsed_s":epoch.elapsed().as_secs_f64(),"phase":phase.load(Ordering::Relaxed),
+            let sample = json!({"elapsed_s":epoch.elapsed().as_secs_f64(),"unix_s":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64(),"phase":phase.load(Ordering::Relaxed),
                 "rss_bytes":sample_rss(),"process_peak_rss_bytes":peak,"user_cpu_s":user,"system_cpu_s":system,
                 "inflight_commands":gauges.commands.load(Ordering::Relaxed),"inflight_payload_bytes":gauges.bytes.load(Ordering::Relaxed)});
-            #[cfg(any(feature = "alloc-diagnostics", feature = "codec-diagnostics"))]
             let mut sample = sample;
-            #[cfg(feature = "alloc-diagnostics")]
-            {
-                sample["alloc"] = json!({"live_requested_bytes":allocation::LIVE.load(Ordering::Relaxed),
-                "peak_requested_bytes":allocation::PEAK.load(Ordering::Relaxed),"allocations":allocation::ALLOCS.load(Ordering::Relaxed),
-                "frees":allocation::FREES.load(Ordering::Relaxed),"reallocations":allocation::REALLOCS.load(Ordering::Relaxed)});
-            }
-            #[cfg(feature = "codec-diagnostics")]
-            {
-                sample["codec"] =
-                    serde_json::to_value(redis::codec_bench_metrics::snapshot()).unwrap();
+            if let Some(metrics) = diagnostics().as_object() {
+                for (name, value) in metrics {
+                    sample[name] = value.clone();
+                }
             }
             writeln!(writer, "{sample}").unwrap();
             writer.flush().unwrap();
@@ -465,6 +491,47 @@ fn histogram_summary(hist: &Histogram<u64>) -> serde_json::Value {
         "p99_us":hist.value_at_quantile(0.99),"p999_us":hist.value_at_quantile(0.999),"max_us":hist.max(),
         "p999_reportable":hist.len() >= 10_000 && hist.value_at_quantile(0.999) != hist.max()})
 }
+fn save_group(
+    out: &std::path::Path,
+    name: &str,
+    lat: &Latencies,
+    pipeline: bool,
+) -> Result<serde_json::Value, String> {
+    for (kind, hist) in [
+        ("response", &lat.service),
+        ("scheduled", &lat.end_to_end),
+        ("scheduling", &lat.scheduling),
+    ] {
+        let mut file = File::create(out.join(format!("latency-{name}-{kind}.hdr")))
+            .map_err(|e| e.to_string())?;
+        V2Serializer::new()
+            .serialize(hist, &mut file)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(
+        json!({"commands":lat.commands,"bytes":lat.bytes,"response":histogram_summary(&lat.service),
+        "scheduled_to_response":histogram_summary(&lat.end_to_end),"scheduling":histogram_summary(&lat.scheduling),
+        "pipeline_members_share_batch_latency":pipeline}),
+    )
+}
+fn merge_group(target: &mut Latencies, source: &Latencies) -> Result<(), String> {
+    target
+        .service
+        .add(&source.service)
+        .map_err(|e| e.to_string())?;
+    target
+        .end_to_end
+        .add(&source.end_to_end)
+        .map_err(|e| e.to_string())?;
+    target
+        .scheduling
+        .add(&source.scheduling)
+        .map_err(|e| e.to_string())?;
+    target.commands += source.commands;
+    target.bytes += source.bytes;
+    Ok(())
+}
+
 async fn run(config: Config, out: PathBuf) -> Result<(), String> {
     fs::create_dir_all(&out).map_err(|e| e.to_string())?;
     let url = std::env::var("REDIS_URL")
@@ -495,8 +562,12 @@ async fn run(config: Config, out: PathBuf) -> Result<(), String> {
         .map(|size| Arc::new(vec![0x5a; size]))
         .collect();
     let epoch = Instant::now();
+    let epoch_unix_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
     let gauges = Arc::new(Gauges::default());
-    let phase_id = Arc::new(AtomicU64::new(0)); // 0=warmup, 1=measured, 2=idle, 3=connections dropped
+    let phase_id = Arc::new(AtomicU64::new(0)); // 0=warmup, 1=measured, 2=idle, 3=connections dropped, 4=result serialization
     let stop = Arc::new(AtomicBool::new(false));
     let sampler = collector(
         out.join("samples.jsonl"),
@@ -508,43 +579,54 @@ async fn run(config: Config, out: PathBuf) -> Result<(), String> {
     let mut errors =
         BufWriter::new(File::create(out.join("errors.jsonl")).map_err(|e| e.to_string())?);
     let result = async {
-        if config.warmup_s > 0 { phase(&config,config.warmup_s,&conns,&payloads,gauges.clone(),false,&mut errors,epoch).await?; }
+        if config.warmup_s > 0 { phase(&config,config.warmup_s,&conns,&payloads,gauges.clone(),&mut errors,epoch).await?; }
         let (start_user,start_system,_) = usage();
+        let diagnostic_start = diagnostics();
         gauges.peak_commands.store(0,Ordering::Relaxed); gauges.peak_bytes.store(0,Ordering::Relaxed);
         phase_id.store(1,Ordering::Relaxed);
         let measure_start_s = epoch.elapsed().as_secs_f64();
-        let (stats,drain_s) = phase(&config,config.duration_s,&conns,&payloads,gauges.clone(),true,&mut errors,epoch).await?;
+        let (stats,drain_s) = phase(&config,config.duration_s,&conns,&payloads,gauges.clone(),&mut errors,epoch).await?;
         let measure_end_s = epoch.elapsed().as_secs_f64();
         let (end_user,end_system,process_peak_rss) = usage();
+        let diagnostic_end = diagnostics();
         phase_id.store(2,Ordering::Relaxed);
         tokio::time::sleep(Duration::from_secs(config.idle_s)).await;
         drop(conns);
         phase_id.store(3,Ordering::Relaxed);
         tokio::time::sleep(Duration::from_secs(2)).await;
+        phase_id.store(4,Ordering::Relaxed); // Keep report allocations out of drop observations.
         let mut groups = BTreeMap::new();
-        for (size,lat) in &stats.groups {
-            groups.insert(size.to_string(),json!({"commands":lat.commands,"bytes":lat.bytes,
-                "response":histogram_summary(&lat.service),"scheduled_to_response":histogram_summary(&lat.end_to_end),
-                "scheduling":histogram_summary(&lat.scheduling),"pipeline_members_share_batch_latency":config.pipeline_batch>1}));
-            for (name,hist) in [("response",&lat.service),("scheduled",&lat.end_to_end),("scheduling",&lat.scheduling)] {
-                let mut file = File::create(out.join(format!("latency-{size}-{name}.hdr"))).map_err(|e|e.to_string())?;
-                V2Serializer::new().serialize(hist,&mut file).map_err(|e|e.to_string())?;
+        let mut aggregates = BTreeMap::new();
+        for (size, lat) in &stats.groups {
+            groups.insert(size.to_string(), save_group(&out, &size.to_string(), lat, config.pipeline_batch > 1)?);
+            merge_group(aggregates.entry("all").or_insert_with(Latencies::new), lat)?;
+            if matches!(config.workload.as_str(), "rare" | "burst" | "single-spike") {
+                let name = if *size < 1024 * 1024 { "ordinary" } else { "spike" };
+                merge_group(aggregates.entry(name).or_insert_with(Latencies::new), lat)?;
             }
         }
+        let mut aggregate_groups = BTreeMap::new();
+        for (name, lat) in &aggregates {
+            aggregate_groups.insert(*name, save_group(&out, name, lat, config.pipeline_batch > 1)?);
+        }
+        if config.workload == "single-spike" && stats.per_connection_large.iter().sum::<u64>() != 1 {
+            return Err("Single spike was skipped; probe invalid".into());
+        }
         let rate = stats.completed as f64/config.duration_s as f64;
-        let summary = json!({"schema":1,"config":config,"build_commit":env!("CODEC_BENCH_COMMIT"),
+        let summary = json!({"schema":2,"config":config,"build_commit":option_env!("CODEC_BENCH_COMMIT").unwrap_or("unrecorded-test-build"),
             "patched_api":cfg!(feature="patched"),"allocator":if cfg!(feature="jemalloc") {"jemalloc"} else {"system"},
             "allocation_diagnostics":cfg!(feature="alloc-diagnostics"),"codec_diagnostics":cfg!(feature="codec-diagnostics"),
-            "pacing_tick_us":1000,"measure_start_s":measure_start_s,"measure_end_s":measure_end_s,
+            "epoch_unix_s":epoch_unix_s,"pacing_tick_us":1000,"measure_start_s":measure_start_s,"measure_end_s":measure_end_s,
             "submit_window_s":config.duration_s,"drain_s":drain_s,"completed":stats.completed,"offered":stats.offered,
-            "not_submitted":stats.not_submitted,"errors":stats.errors,"achieved_commands_s":rate,
-            "status":if config.workload=="single-spike" {"PROBE"} else if rate >= config.rate as f64*0.95 {"OK"} else {"LIMITED"},
+            "not_submitted":stats.not_submitted,"capacity_skipped":stats.capacity_skipped,"deadline_skipped":stats.deadline_skipped,"errors":stats.errors,"achieved_commands_s":rate,
+            "status":if matches!(config.workload.as_str(),"single-spike"|"burst") {"PROBE"} else if rate >= config.rate as f64*0.95 {"OK"} else {"LIMITED"},
             "payload_bytes_each_direction":stats.bytes,"user_cpu_s":end_user-start_user,"system_cpu_s":end_system-start_system,
             "cpu_us_per_command":if stats.completed>0 {(end_user-start_user+end_system-start_system)*1e6/stats.completed as f64} else {0.0},
             "process_peak_rss_bytes_includes_warmup":process_peak_rss,
             "peak_inflight_commands":gauges.peak_commands.load(Ordering::Relaxed),
             "peak_inflight_payload_bytes":gauges.peak_bytes.load(Ordering::Relaxed),
-            "large_commands_per_connection":stats.per_connection_large,"groups":groups});
+            "large_commands_per_connection":stats.per_connection_large,"groups":groups,"aggregate_groups":aggregate_groups,
+            "diagnostic_start":diagnostic_start,"diagnostic_end":diagnostic_end});
         fs::write(out.join("summary.json"),serde_json::to_vec_pretty(&summary).unwrap()).map_err(|e|e.to_string())?;
         Ok(())
     }.await;
@@ -583,7 +665,20 @@ fn main() {
         || config.duration_s == 0
         || config.pipeline_batch == 0
         || config.pipeline_batch > config.per_connection_inflight
-        || config.pipeline_batch > u32::MAX as usize
+        || config.per_connection_inflight > u32::MAX as usize
+        || config
+            .rate
+            .checked_mul(config.duration_s.max(config.warmup_s).max(20))
+            .is_none()
+        || config
+            .connections
+            .checked_mul(config.per_connection_inflight)
+            .is_none()
+        || (config.workload == "single-spike"
+            && (config.duration_s <= 5
+                || config.warmup_s != 0
+                || config.connections != 1
+                || config.pipeline_batch != 1))
         || sizes(&config.workload).is_err()
         || !matches!(config.spike_mode.as_str(), "random" | "synchronized")
     {
@@ -620,6 +715,23 @@ mod tests {
             seed: 42,
             spike_mode: "random".into(),
         }
+    }
+    #[test]
+    fn pipeline_tail_and_due_time() {
+        assert_eq!(due_batch(96, 100, 100, 4), Some(4));
+        assert_eq!(due_batch(100, 102, 103, 4), None);
+        assert_eq!(due_batch(100, 103, 103, 4), Some(3));
+        assert_eq!(due_batch(103, 103, 103, 4), None);
+    }
+    #[test]
+    fn merged_latency_is_not_mean_of_percentiles() {
+        let mut a = Latencies::new();
+        let mut b = Latencies::new();
+        a.service.record_n(10, 99).unwrap();
+        b.service.record(1000).unwrap();
+        merge_group(&mut a, &b).unwrap();
+        assert_eq!(a.service.len(), 100);
+        assert_eq!(a.service.value_at_quantile(0.5), 10);
     }
     #[test]
     fn rare_distribution_and_connection_coverage() {

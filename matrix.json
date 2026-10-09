@@ -1,0 +1,224 @@
+{
+  "defaults": {
+    "workers": 4,
+    "seed": 20261010,
+    "variants": [
+      "baseline",
+      "patched-off",
+      "patched-on"
+    ],
+    "spike_mode": "random",
+    "mode": "scored"
+  },
+  "profiles": {
+    "small": {
+      "workload": "small",
+      "rate": 50000,
+      "budget": 128
+    },
+    "rare": {
+      "workload": "rare",
+      "rate": 2000,
+      "budget": 64
+    },
+    "near": {
+      "workload": "near",
+      "rate": 2000,
+      "budget": 64
+    },
+    "large-50": {
+      "workload": "large",
+      "rate": 50,
+      "budget": 16
+    },
+    "large-200": {
+      "workload": "large",
+      "rate": 200,
+      "budget": 16
+    },
+    "single-spike": {
+      "workload": "single-spike",
+      "rate": 50,
+      "budget": 16
+    },
+    "burst": {
+      "workload": "burst",
+      "rate": 50,
+      "budget": 16
+    }
+  },
+  "stages": {
+    "small-capacity-pilot": {
+      "connections": [
+        1,
+        16
+      ],
+      "profiles": [
+        "small"
+      ],
+      "duration_s": 30,
+      "warmup_s": 5,
+      "idle_s": 0,
+      "repetitions": 1
+    },
+    "screening": {
+      "connections": [
+        1,
+        2,
+        4,
+        8,
+        16
+      ],
+      "profiles": [
+        "small",
+        "rare",
+        "near",
+        "large-50",
+        "large-200"
+      ],
+      "duration_s": 120,
+      "warmup_s": 10,
+      "idle_s": 10,
+      "repetitions": 1
+    },
+    "main": {
+      "connections": [
+        1,
+        16,
+        100
+      ],
+      "profiles": [
+        "small",
+        "rare",
+        "near",
+        "large-50",
+        "large-200"
+      ],
+      "duration_s": 300,
+      "warmup_s": 30,
+      "idle_s": 30,
+      "repetitions": 3
+    },
+    "knee-validation": {
+      "connections": [
+        2,
+        4,
+        8
+      ],
+      "profiles": [
+        "small",
+        "rare",
+        "near",
+        "large-50",
+        "large-200"
+      ],
+      "duration_s": 300,
+      "warmup_s": 30,
+      "idle_s": 30,
+      "repetitions": 3
+    },
+    "diagnostic": {
+      "connections": [
+        1
+      ],
+      "profiles": [
+        "rare",
+        "large-50",
+        "large-200",
+        "single-spike",
+        "burst"
+      ],
+      "inflight": [
+        1,
+        4,
+        16,
+        64
+      ],
+      "duration_s": 180,
+      "warmup_s": 10,
+      "idle_s": 60,
+      "repetitions": 1,
+      "mode": "diagnostic"
+    },
+    "pipeline-screening": {
+      "connections": [
+        1,
+        4,
+        16
+      ],
+      "profiles": [
+        "rare",
+        "large-200"
+      ],
+      "pipeline_batches": [
+        1,
+        4,
+        16
+      ],
+      "budget": 64,
+      "duration_s": 180,
+      "warmup_s": 10,
+      "idle_s": 30,
+      "repetitions": 1
+    },
+    "synchronized-stress": {
+      "connections": [
+        1,
+        16,
+        100
+      ],
+      "profiles": [
+        "rare"
+      ],
+      "spike_mode": "synchronized",
+      "duration_s": 120,
+      "warmup_s": 10,
+      "idle_s": 30,
+      "repetitions": 1
+    },
+    "jemalloc-screening": {
+      "connections": [
+        1,
+        16,
+        100
+      ],
+      "profiles": [
+        "small",
+        "rare",
+        "near",
+        "large-50",
+        "large-200"
+      ],
+      "duration_s": 120,
+      "warmup_s": 10,
+      "idle_s": 30,
+      "repetitions": 1,
+      "mode": "jemalloc"
+    },
+    "confirmation": {
+      "groups": [
+        {
+          "connections": [
+            1
+          ],
+          "profiles": [
+            "rare",
+            "large-200"
+          ]
+        },
+        {
+          "connections": [
+            100
+          ],
+          "profiles": [
+            "rare"
+          ]
+        }
+      ],
+      "duration_s": 900,
+      "warmup_s": 30,
+      "idle_s": 60,
+      "repetitions": 3
+    }
+  }
+}

@@ -33,7 +33,7 @@ reproduce the unavailable old benchmark lockfile. Baseline and patched dependenc
 hashes must match before the runner starts.
 
 Default scored builds use the system allocator. Diagnostic builds track requested
-live bytes and allocation/reallocation/free counts and add codec counters. Those
+live bytes, allocation/reallocation/free counts and requested-byte churn and add codec counters. Those
 builds are separate from scored builds. Optional jemalloc builds are a separate
 allocator experiment; compare baseline and patch within each allocator.
 
@@ -51,14 +51,11 @@ to install the toolchain and monitoring utilities. For other package managers,
 install equivalent packages. No setup/build should overlap measured traffic. Full Linux
 performance runs and Linux telemetry have not yet been validated by this kit.
 
-Local preparation checks passed: both scored and diagnostic source versions build;
-three unit tests; twelve short baseline/off/on workload and pipeline cases; six
-single-spike probes across scored/diagnostic builds. Resume skips validated results,
-and connection failure remains an incomplete attempt. These loopback checks
-validate the harness, not performance or Linux RSS collection. The patched-on
-single-spike diagnostic observed one completed-response read trim and one write
-trim; disabled and baseline observed none. No partial-response trim was observed
-in that short probe, so that proposed explanation remains unproven.
+Local checks cover builds, unit tests, all four workloads, explicit pipelines,
+single-spike probes, resume and connection failure. These checks validate correctness,
+not performance or Linux RSS collection. The full matrix must run on the target Linux
+host. GitHub CI checks both allocators against loopback Redis with Linux telemetry;
+it does not run the performance matrix. A cause for the previous single-connection RSS increase is not yet established.
 
 ## Workloads
 
@@ -77,7 +74,7 @@ is checked for size and first/last 16-byte markers, without scanning megabytes i
 the scored hot path. Decoded responses are dropped before recording completion.
 
 All variants in a repetition use the same seed and offered command sequence.
-Incomplete offered commands are counted; they are not silently queued without a
+Capacity skips and submission-deadline skips are counted separately; they are not silently queued without a
 bound. The scheduler uses documented 1 ms ticks. At high rates it consequently
 submits small groups per tick, which can affect batching and latency. This pacing
 is identical across versions but should not be presented as exact reproduction of
@@ -96,28 +93,64 @@ aggregate concurrency budget. The diagnostic sweep uses one connection with
 Clones share each MultiplexedConnection's physical socket. Four Tokio workers
 drive asynchronous requests; concurrency does not imply one OS thread per request.
 
-Explicit pipelines are a separate screening phase: batches of 4 or 16, with total
+Explicit pipelines are a separate screening phase: matched controls with batch 1,
+plus batches of 4 or 16, with total
 outstanding command budget 64 across 1,4,16 connections where that is possible.
 The external semaphore counts pipeline members, not batches; the client default
 internal concurrency policy is unchanged. Rate is commands/s, not batches/s.
 Pipeline members are attributed batch completion latency; individual reply arrival
 times are not measured and must not be claimed. Record total batch/request bytes.
 
-## Stages, not one unconditional giant launch
+## Configure and inspect the matrix
 
-Generate plans with `python3 scripts/make_plans.py`. Review short capacity pilots
-before interpreting LIMITED results. Do not automatically start all plans.
+[`matrix.json`](matrix.json) is the editable source of truth. It defines workload
+rates and concurrency budgets, variants, worker count, seeds, connection counts,
+repetitions, durations, warm-up/idle periods and pipeline sizes for each stage.
+Payload distributions and the enabled 64 KiB threshold are defined in the Rust
+harness; changing those requires a rebuild. This matrix compares the existing patch,
+not new trimming policies.
 
-* `small-capacity-pilot`: six 30-second baseline/off/on cases for 1 and 16 connections.
-* `screening`: 75 two-minute cases across 1,2,4,8,16, approximately three hours
-  including warm-up and post-traffic observation.
-* `main`: 135 five-minute cases across 1,16,100, three repetitions, approximately
-  13.6 hours including warm-up and post-traffic observation.
-* `diagnostic`: 48 three-minute allocation/codec-instrumented cases, approximately
-  3.4 hours. Includes rare, large, a single spike followed by no commands, and bursts.
-* `pipeline-screening`: 30 three-minute cases, approximately 1.9 hours.
-* `confirmation`: candidate 15-minute runs for the known anomalies and rare/100,
-  approximately 7.4 hours. Select cases after seeing RSS slopes and coverage.
+Generate frozen JSON plans and a readable stage inventory:
+
+```sh
+python3 scripts/make_plans.py
+python3 scripts/make_plans.py --list
+```
+
+See [`plans/README.md`](plans/README.md) for run counts, build modes, concurrency,
+batch sizes and estimated runtime. Each JSON plan contains the full cases and its
+build mode. The runner automatically chooses scored, diagnostic or jemalloc binaries
+from that mode; a contradictory command-line build flag is rejected.
+
+For example, select a smaller knee study without editing the default plans:
+
+```sh
+python3 scripts/make_plans.py --stage knee-validation --connections 2,4,8 \
+  --profiles rare,large-200 --repetitions 3 --duration-s 300 --workers 4 \
+  --output plans/custom
+```
+
+`--variants baseline,patched-off` selects only the disabled-path comparison.
+Workload rates, pipeline sizes, single-connection in-flight sweeps, observation
+periods and optional stage selections can be edited in `matrix.json`. For custom counts that do not divide a concurrency budget, the
+per-connection limit is rounded down (minimum one); the inventory shows the actual
+aggregate limit.
+Review pilots before interpreting LIMITED results. Generating plans never starts traffic.
+
+| Stage | Purpose |
+| --- | --- |
+| small-capacity-pilot | Check small-workload capacity at 1 and 16 connections |
+| screening | All four patterns at 1,2,4,8,16 connections, two measured minutes |
+| main | All patterns at 1,16,100, five minutes, three repetitions |
+| knee-validation | Repeated five-minute comparisons at 2,4,8; filter after screening |
+| diagnostic | One connection, 1/4/16/64 in flight; rare, large at both rates, single spike and burst |
+| pipeline-screening | Rare and large/200 with matched batch-1/4/16 controls and budget 64 |
+| synchronized-stress | Separately labelled synchronized rare spikes |
+| jemalloc-screening | Optional matched versions using jemalloc |
+| confirmation | Candidate 15-minute runs for known anomalies; select after screening |
+
+Optional stages are available, not an unconditional launch of every combination.
+Use `--repetitions 3` for a selected pipeline or allocator follow-up when needed.
 
 These estimates exclude connection setup, drain and provisioning. Stage selection
 is intentional: extend unresolved comparisons, not every case. Intermediate
@@ -140,21 +173,29 @@ labelled stress case.
 * User/system CPU, total CPU per command, actual peak outstanding commands and
   payload bytes. CPU belongs to the whole client process, including harness work.
 * RSS at 250 ms, process high-water RSS, steady RSS over the final two minutes,
-  average RSS, idle observation and connection-drop observation. The process high
+  average RSS, RSS slopes, final idle RSS and connection-drop RSS (before result serialization). Slopes help
+  select longer confirmations; they do not prove a leak or steady state. The process high
   water includes warm-up; sampled measured peaks are reported separately. Shorter
   than 250 ms spikes can be missed by the time series, but the process high water
   still detects their maximum without precise timing.
-* Per-payload-size HDR histograms (3 significant digits) and mean/p50/p99/p99.9/max
+* Exact payload-size and merged overall/ordinary/spike HDR histograms (3 significant digits) and mean/p50/p99/p99.9/max
   for submission-to-completion, scheduled-to-completion and scheduling delay.
   Record sample count; suppress p99.9 when it equals max or has fewer than 10,000
-  observations. Skipped offered requests are visible as not-submitted, not invented
+  observations. The CSV leaves unreportable p99.9 blank. Skipped offered requests are visible as not-submitted, not invented
   latency samples. Median run percentiles and pooled percentiles are distinct.
 * Host CPU, memory, pressure, network bytes/errors/retransmissions each second;
-  process status and smaps_rollup. Preserve raw counters for later delta analysis.
-* Diagnostic requested-live/peak bytes and allocation counts; read/write observed
+  process status and smaps_rollup. The analyzer reports measured-window host deltas
+  and sample spans. Optional `--server-info` samples endpoint INFO counters every
+  five seconds using `redis-cli`; this covers one endpoint, not all cluster nodes.
+  Unavailable counters are explicit. INFO adds a small observer load.
+* Diagnostic requested-live/peak bytes, allocation counts and requested-byte churn; read/write observed
   capacity maxima, trim counts and read trims with incomplete versus complete
-  decoded responses. BytesMut capacity can hide retained storage after advance.
-  Allocation counters do not measure malloc rounding, fragmentation, libc internal
+  decoded responses. Counter deltas isolate the measured window; growth counts,
+  observed capacity changes and replacement requested capacity are also retained.
+  Reallocation churn counts the old requested size as freed and the new requested
+  size as allocated, even when libc resizes in place. BytesMut capacity can hide retained storage after advance.
+  Observed growth/capacity totals do not equal actual allocated or reclaimed bytes.
+  Diagnostic peaks include warm-up. Allocation counters do not measure malloc rounding, fragmentation, libc internal
   realloc overlap, kernel socket buffers, or allocation stacks. Separate profiling
   is needed if these counters leave the cause unresolved.
 
@@ -167,24 +208,37 @@ git clone https://github.com/ofirluzon/redis-rs-codec-bench.git
 cd redis-rs-codec-bench
 python3 scripts/build.py
 python3 scripts/build.py --diagnostics
+# Optional allocator experiment:
+python3 scripts/build.py --jemalloc
 ```
 
 `bash scripts/bootstrap-linux.sh` is an optional setup helper for supported Linux distributions.
 To run the loopback correctness checks, install `redis-server` and execute
 `python3 scripts/local_check.py` after building both scored and diagnostic binaries.
+The optional allocator build can be checked with `python3 scripts/local_check.py --jemalloc`.
+Python regression tests run with `python3 -m unittest discover -s tests -v`.
+After `build.py` prepares the source, run `cargo test --locked --features patched`
+and `cargo clippy --locked --features patched,alloc-diagnostics,codec-diagnostics -- -D warnings`.
 
 Set `REDIS_URL` in the process environment. A local example is
 `export REDIS_URL=redis://127.0.0.1:6379`. The URL is not saved as configuration in
 results. Start a reviewed stage explicitly, for example:
 
 ```sh
-python3 scripts/run_matrix.py plans/screening.json --results results/screening
+python3 scripts/run_matrix.py plans/screening.json --results results/screening --server-info
 python3 scripts/analyze.py results/screening
 ```
 
 Each failed attempt stays separate. Only validated DONE attempts enter analysis.
+Checksums protect every completed artifact; resume and analysis recheck configuration,
+counts, timing, build modes, telemetry and hashes. Only one matrix may run per host/user at a time, even in different results
+directories. Different durations, worker counts, spike modes and builds
+have separate medians. Whole-run CPU/RSS repeat on each latency-group row and must
+not be summed.
 Zero command errors are required; under 95% target is LIMITED rather than a false
-success. Resuming on a different host/environment is rejected. Copy completed
+success. Resuming on a different host, endpoint identity, collector mode or environment is rejected.
+The result directory retains a kit snapshot with source, scripts, lockfile and exact
+binaries, in addition to build hashes and configuration. Copy completed
 results off-host after each stage, and periodically during long stages. Preserve
 the entire kit (including Cargo.lock), raw histograms and telemetry in durable
 local storage before terminating the instance. `scripts/backup_results.py` pulls
