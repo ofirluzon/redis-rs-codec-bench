@@ -1,61 +1,85 @@
 #!/usr/bin/env python3
+"""Generate frozen plans and a readable inventory from matrix.json. Never runs traffic."""
+import argparse
 import json
 from pathlib import Path
-
+from validation import normalize_plan, VARIANTS
 ROOT = Path(__file__).resolve().parents[1]
-VERSIONS = ['baseline','patched-off','patched-on']
-PROFILES = [('small',50000),('rare',2000),('near',2000),('large',50),('large',200)]
 
-def cases(connections, duration, repetitions, warmup=30, idle=30, fixed_total=True):
-    result=[]
-    for rep in range(repetitions):
-        for workload,rate in PROFILES:
-            for count in connections:
-                total = {'small':128,'rare':64,'near':64,'large':16}[workload]
-                per = max(1,total//count)
-                for version in VERSIONS[rep%3:]+VERSIONS[:rep%3]:
-                    result.append({'id':f'{workload}-{rate}-c{count}-i{per}-r{rep+1}-{version}',
-                        'variant':version,'workload':workload,'connections':count,'per_connection_inflight':per,
-                        'rate':rate,'duration_s':duration,'warmup_s':warmup,'idle_s':idle,'workers':4,
-                        'pipeline_batch':1,'seed':20261010+rep,'spike_mode':'random'})
-    return result
-
-def write(name, rows):
-    path=ROOT/'plans'/f'{name}.json'
-    path.write_text(json.dumps(rows,indent=2))
-    seconds=sum(r['duration_s']+r['warmup_s']+r['idle_s']+2 for r in rows)
-    print(f'{name}: {len(rows)} runs, {seconds/3600:.2f} hours excluding setup/drain time')
+def generate(matrix, stage, overrides=None):
+    defaults = matrix['defaults']
+    settings = dict(defaults, **matrix['stages'][stage])
+    settings.update(overrides or {})
+    if settings.get('mode','scored') not in ['scored','diagnostic','jemalloc']: raise ValueError('Invalid stage build mode')
+    if not settings.get('variants') or any(v not in VARIANTS for v in settings['variants']): raise ValueError('Invalid variants')
+    rows = []
+    groups = settings.get('groups', [{}])
+    for group in groups:
+        cfg = dict(settings, **group)
+        # CLI overrides apply to every group, including confirmation selections.
+        cfg.update(overrides or {})
+        for rep in range(cfg['repetitions']):
+            versions = cfg['variants']
+            offset = rep % len(versions)
+            versions = versions[offset:] + versions[:offset]
+            for profile in cfg['profiles']:
+                p = matrix['profiles'][profile]
+                for count in cfg['connections']:
+                    budget = cfg.get('budget', p['budget'])
+                    per_values = cfg.get('inflight', [max(1, budget // count)])
+                    for per in per_values:
+                        for batch in cfg.get('pipeline_batches', [1]):
+                            if batch > per: continue
+                            # Preserve exactly the selected aggregate budget for pipeline controls.
+                            if 'pipeline_batches' in cfg and count * per != budget: continue
+                            for version in versions:
+                                case = dict(id=f'{stage}-{profile}-c{count}-i{per}-b{batch}-r{rep+1}-{version}',
+                                            variant=version, workload=p['workload'], connections=count,
+                                            per_connection_inflight=per, rate=p['rate'], duration_s=cfg['duration_s'],
+                                            warmup_s=0 if p['workload']=='single-spike' else cfg['warmup_s'],
+                                            idle_s=cfg['idle_s'], workers=cfg['workers'], pipeline_batch=batch,
+                                            seed=cfg['seed']+rep, spike_mode=cfg['spike_mode'])
+                                rows.append(case)
+    return normalize_plan(rows), settings.get('mode', 'scored')
 
 def main():
-    write('screening',cases([1,2,4,8,16],120,1,warmup=10,idle=10))
-    write('main',cases([1,16,100],300,3))
-    # A separate small-payload capacity pilot: a fixed total of 16 may not reach 50k/s at network RTT.
-    write('small-capacity-pilot',[r for r in cases([1,16],30,1,warmup=5,idle=0,fixed_total=False) if r['workload']=='small'])
-    diagnostic=[]
-    for workload,rate in [('rare',2000),('large',200),('single-spike',50),('burst',50)]:
-        for inflight in [1,4,16,64]:
-            for version in VERSIONS:
-                diagnostic.append({'id':f'diagnostic-{workload}-{rate}-c1-i{inflight}-{version}',
-                    'variant':version,'workload':workload,'connections':1,'per_connection_inflight':inflight,
-                    'rate':rate,'duration_s':180,'warmup_s':0 if workload=='single-spike' else 10,'idle_s':60,'workers':4,
-                    'pipeline_batch':1,'seed':20261010,'spike_mode':'random'})
-    write('diagnostic',diagnostic)
-    pipelines=[]
-    for count in [1,4,16]:
-        for batch in [4,16]:
-            for workload,rate in [('rare',2000),('large',200)]:
-                # Fixed total outstanding=64 across counts and both pipeline batch sizes.
-                for version in VERSIONS:
-                    pipelines.append({'id':f'pipeline-{workload}-{rate}-c{count}-b{batch}-{version}',
-                        'variant':version,'workload':workload,'connections':count,'per_connection_inflight':max(batch,64//count),
-                        'rate':rate,'duration_s':180,'warmup_s':10,'idle_s':30,'workers':4,
-                        'pipeline_batch':batch,'seed':20261010,'spike_mode':'random'})
-    # c16/b16 requires total 256; exclude so the pipeline comparison stays at 64 outstanding.
-    pipelines=[r for r in pipelines if r['connections']*r['per_connection_inflight']==64]
-    write('pipeline-screening',pipelines)
-    # Extended confirmation is selected from screening; these are the known problematic cases.
-    write('confirmation',[r for r in cases([1,100],900,3,warmup=30,idle=60)
-                          if (r['connections']==1 and (r['workload']=='rare' or (r['workload']=='large' and r['rate']==200)))
-                          or (r['connections']==100 and r['workload']=='rare')])
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--config', type=Path, default=ROOT/'matrix.json')
+    p.add_argument('--stage', action='append', help='Select stage(s); default generates all plans, never launches')
+    p.add_argument('--output', type=Path, default=ROOT/'plans')
+    p.add_argument('--list', action='store_true', help='Print inventory without writing plans')
+    p.add_argument('--connections', help='Comma-separated physical counts')
+    p.add_argument('--profiles', help='Comma-separated profile names in matrix.json')
+    p.add_argument('--variants', help='Comma-separated baseline,patched-off,patched-on')
+    for flag in ['duration-s','repetitions','workers']: p.add_argument('--'+flag, type=int)
+    args = p.parse_args()
+    matrix = json.loads(args.config.read_text())
+    overrides = {}
+    for name in ['connections','profiles','variants']:
+        value = getattr(args,name)
+        if value: overrides[name] = [int(x) for x in value.split(',')] if name=='connections' else value.split(',')
+    for name in ['duration_s','repetitions','workers']:
+        value = getattr(args,name)
+        if value is not None:
+            if value <= 0: p.error(name+' must be positive')
+            overrides[name] = value
+    if any(v not in VARIANTS for v in overrides.get('variants', [])): p.error('Unknown variant')
+    table = ['# Generated matrix inventory', '', 'All rates are aggregate commands/s; times exclude setup and drain.', '',
+             '| Stage | Build mode | Runs | Measured seconds | Connections | Total in flight | Pipeline batch | Repeats | Minimum hours |',
+             '| --- | --- | ---: | --- | --- | --- | --- | ---: | ---: |']
+    for stage in args.stage or matrix['stages']:
+        try: rows, mode = generate(matrix, stage, overrides)
+        except (KeyError, ValueError, TypeError) as e: p.error(str(e))
+        unique = lambda name: ','.join(str(x) for x in sorted({r[name] for r in rows}))
+        seconds = sum(r['duration_s']+r['warmup_s']+r['idle_s']+2 for r in rows)
+        total = ','.join(str(x) for x in sorted({r['connections']*r['per_connection_inflight'] for r in rows}))
+        reps = (overrides.get('repetitions') or matrix['stages'][stage]['repetitions'])
+        table.append(f'| {stage} | {mode} | {len(rows)} | {unique("duration_s")} | {unique("connections")} | {total} | {unique("pipeline_batch")} | {reps} | {seconds/3600:.2f} |')
+        if not args.list:
+            args.output.mkdir(parents=True, exist_ok=True)
+            (args.output/(stage+'.json')).write_text(json.dumps(dict(schema=1,mode=mode,cases=rows),indent=2)+'\n')
+    text = '\n'.join(table)+'\n'
+    print(text)
+    if not args.list: (args.output/'README.md').write_text(text)
 
-if __name__=='__main__':main()
+if __name__=='__main__': main()
