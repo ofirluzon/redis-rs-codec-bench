@@ -48,12 +48,13 @@ same host and software environment; separate results across different architectu
 Requirements: Rust 1.98.1, Python 3, Git, a C/C++ build toolchain, and a reachable
 Redis-compatible endpoint. An optional Linux bootstrap helper supports DNF and APT
 to install the toolchain and monitoring utilities. For other package managers,
-install equivalent packages. No setup/build should overlap measured traffic. Full Linux
-performance runs and Linux telemetry have not yet been validated by this kit.
+install equivalent packages. No setup/build should overlap measured traffic.
+Linux loopback CI validates telemetry and both allocators. The full performance
+matrix has not run yet.
 
 Local checks cover builds, unit tests, all four workloads, explicit pipelines,
 single-spike probes, resume and connection failure. These checks validate correctness,
-not performance or Linux RSS collection. The full matrix must run on the target Linux
+not performance. The full matrix must run on the target Linux
 host. GitHub CI checks both allocators against loopback Redis with Linux telemetry;
 it does not run the performance matrix. A cause for the previous single-connection RSS increase is not yet established.
 
@@ -150,7 +151,11 @@ Review pilots before interpreting LIMITED results. Generating plans never starts
 | confirmation | Candidate 15-minute runs for known anomalies; select after screening |
 
 Optional stages are available, not an unconditional launch of every combination.
-Use `--repetitions 3` for a selected pipeline or allocator follow-up when needed.
+Every comparison and diagnostic stage defaults to **three repetitions**; only the
+short capacity pilot runs once. `--repetitions N` overrides the selected stages.
+Generating every plan does not run them. See the inventory before choosing stages:
+the primary `main` stage takes at least **13.57 hours**, excluding setup/drain;
+optional stages add their own time.
 
 These estimates exclude connection setup, drain and provisioning. Stage selection
 is intentional: extend unresolved comparisons, not every case. Intermediate
@@ -166,7 +171,18 @@ offer one second of large traffic every 20 seconds. These deliberate probes are 
 scored as steady workloads. Include synchronized rare spikes only as a separately
 labelled stress case.
 
-## Retained measurements
+## Metrics and display
+
+See the [metric reference](docs/METRICS.md) for definitions, units, observation
+windows, diagnostic counters and limitations, and the
+[illustrative report](docs/REPORT_EXAMPLE.md) for the table layout.
+
+Analysis creates `report.md` and `payload_report.md`, with every repetition followed
+by its **arithmetic mean**. It also creates `per_run.csv`, `means.csv` and
+`medians.csv`; raw runs and median summaries remain available. Mean/median run
+percentiles are not pooled percentiles. Missing runs and missing metrics are visible.
+
+### Retained measurements
 
 * Per-run configuration, binary SHA-256, source commit, dependency lockfile hash,
   environment snapshot, completed/offered/not-submitted counts, errors, achieved rate.
@@ -201,52 +217,138 @@ labelled stress case.
 
 ## Build and run
 
-Clone the repository, install the prerequisites, then build both source versions:
+Run these steps **on the Linux benchmark client**, from the repository directory.
+Commands that generate plans or build binaries do not start traffic.
+
+### 1. Get the code and tools
 
 ```sh
 git clone https://github.com/ofirluzon/redis-rs-codec-bench.git
 cd redis-rs-codec-bench
-python3 scripts/build.py
-python3 scripts/build.py --diagnostics
-# Optional allocator experiment:
-python3 scripts/build.py --jemalloc
 ```
 
-`bash scripts/bootstrap-linux.sh` is an optional setup helper for supported Linux distributions.
-To run the loopback correctness checks, install `redis-server` and execute
-`python3 scripts/local_check.py` after building both scored and diagnostic binaries.
-The optional allocator build can be checked with `python3 scripts/local_check.py --jemalloc`.
-Python regression tests run with `python3 -m unittest discover -s tests -v`.
-After `build.py` prepares the source, run `cargo test --locked --features patched`
-and `cargo clippy --locked --features patched,alloc-diagnostics,codec-diagnostics -- -D warnings`.
-
-Set `REDIS_URL` in the process environment. A local example is
-`export REDIS_URL=redis://127.0.0.1:6379`. The URL is not saved as configuration in
-results. Start a reviewed stage explicitly, for example:
+Install Rust 1.98.1, Python 3 and a C/C++ build toolchain. On Amazon Linux 2023
+or Ubuntu/Debian, the optional helper installs these and monitoring utilities:
 
 ```sh
-python3 scripts/run_matrix.py plans/screening.json --results results/screening --server-info
-python3 scripts/analyze.py results/screening
+bash scripts/bootstrap-linux.sh
+source "$HOME/.cargo/env"
 ```
 
-Each failed attempt stays separate. Only validated DONE attempts enter analysis.
-Checksums protect every completed artifact; resume and analysis recheck configuration,
-counts, timing, build modes, telemetry and hashes. Only one matrix may run per host/user at a time, even in different results
-directories. Different durations, worker counts, spike modes and builds
-have separate medians. Whole-run CPU/RSS repeat on each latency-group row and must
-not be summed.
-Zero command errors are required; under 95% target is LIMITED rather than a false
-success. Resuming on a different host, endpoint identity, collector mode or environment is rejected.
-The result directory retains a kit snapshot with source, scripts, lockfile and exact
-binaries, in addition to build hashes and configuration. Copy completed
-results off-host after each stage, and periodically during long stages. Preserve
-the entire kit (including Cargo.lock), raw histograms and telemetry in durable
-local storage before terminating the instance. `scripts/backup_results.py` pulls
-snapshots once or every configured interval (e.g. 600 seconds), using an SSH alias
-supplied at runtime. It copies active attempts too; only DONE-validated attempts
-enter analysis. Raw output can contain machine details, file paths or endpoint
-information in diagnostic errors. Keep it private; share reviewed summaries rather
-than committing a results directory. Start backups alongside long remote stages.
+The helper requires Git to have been installed before cloning. For other Linux
+distributions, install the [host prerequisites](#host-requirements) yourself.
+Finish setup and builds before any measured traffic.
+
+### 2. Build the three comparison versions
+
+```sh
+python3 scripts/build.py
+```
+
+This builds two binaries: baseline and patched. The runner uses the patched binary
+with trimming off and on, producing the three comparison versions automatically.
+No diagnostic or jemalloc build is needed for the normal comparison.
+
+### 3. Choose and inspect a plan
+
+```sh
+python3 scripts/make_plans.py
+python3 scripts/make_plans.py --list
+```
+
+Start with `plans/small-capacity-pilot.json`: six 30-second cases, one repetition.
+For the primary comparison, use `plans/main.json`: 135 five-minute cases, three
+repetitions, at least 13.57 hours **including all three versions and repetitions**.
+That is 5 workload/rate combinations × 3 connection counts × 3 versions × 3
+repetitions = 135 cases. Each case is one version of one configuration.
+See [the inventory](plans/README.md) for the other stages and
+[matrix configuration](#configure-and-inspect-the-matrix) for shorter/custom plans.
+
+### 4. Set the endpoint and run
+
+Set `REDIS_URL` to your test endpoint in the current shell. This loopback URL is
+only an example; use your own endpoint for the benchmark:
+
+```sh
+export REDIS_URL=redis://127.0.0.1:6379
+python3 scripts/run_matrix.py plans/small-capacity-pilot.json --results results/pilot
+```
+
+After checking pilot capacity, start the primary comparison explicitly:
+
+```sh
+python3 scripts/run_matrix.py plans/main.json --results results/main
+```
+
+To collect endpoint INFO too, append `--server-info` to the run command and install
+`redis-cli`. This observes one endpoint, not every cluster node. Choose this option
+before starting: a resumed run must use the same collector setting.
+
+If a run is interrupted, repeat **the same command** to resume. Completed attempts
+are verified and skipped; incomplete attempts are retained and retried separately.
+Only one matrix runs per host/user at a time. The runner rejects a changed plan,
+build, host, endpoint identity or environment in an existing result directory.
+
+### 5. Read and retain the results
+
+```sh
+python3 scripts/analyze.py results/pilot
+python3 scripts/analyze.py results/main
+```
+
+Analyze the directory you ran; you do not need to wait for the whole matrix.
+Open `report.md` for overall/ordinary/spike tables or `payload_report.md` for exact
+sizes. Each table shows individual runs plus their mean, CPU, RSS and latency;
+status and achieved rate follow. CSVs retain all metrics and the alternative
+median summaries. See [metrics and reports](docs/METRICS.md).
+
+Zero command errors are required. An achieved rate below 95% of target is labelled
+`LIMITED`; it is a completed measurement, not a claim that the target was reached.
+Only checksum-validated DONE attempts enter analysis.
+
+Copy results off the host during long stages and before deleting the instance.
+From your local computer, supply your SSH alias and the remote results path:
+
+```sh
+python3 scripts/backup_results.py YOUR_SSH_ALIAS /path/to/results ./saved-results --every-seconds 600
+```
+
+Keep the whole result directory, including raw histograms, telemetry and the `kit/`
+snapshot of source, documentation, lockfile and exact binaries. Backups include
+active attempts too; analysis still excludes incomplete attempts. Raw results can
+contain machine details, paths or endpoint information in errors. Keep them private
+and share reviewed summaries. The endpoint URL is not stored as run configuration.
+
+### Optional experiments
+
+Build only the additional mode you intend to run:
+
+| Experiment | Build first | Run plan |
+| --- | --- | --- |
+| Allocation/codec diagnostics | `python3 scripts/build.py --diagnostics` | `plans/diagnostic.json` |
+| jemalloc comparison | `python3 scripts/build.py --jemalloc` | `plans/jemalloc-screening.json` |
+
+Use the same `run_matrix.py PLAN --results DIRECTORY` command with a separate result
+directory for each stage. The plan selects the correct binaries automatically.
+Diagnostic builds add instrumentation overhead and are separate from scored results.
+
+### Optional correctness checks
+
+These use an isolated loopback Redis, not your configured benchmark endpoint.
+Install `redis-server`, build scored and diagnostic binaries, then run:
+
+```sh
+python3 -m unittest discover -s tests -v
+python3 scripts/local_check.py
+```
+
+After a jemalloc build, `python3 scripts/local_check.py --jemalloc` checks that mode.
+After `build.py` prepares upstream sources, Rust checks are:
+
+```sh
+cargo test --locked --features patched
+cargo clippy --locked --features patched,alloc-diagnostics,codec-diagnostics -- -D warnings
+```
 
 TTL, pooling and the single-connection exception are design candidates only, not
 implemented binaries. First explain the existing regression. Implement any chosen

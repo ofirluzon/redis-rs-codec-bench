@@ -64,7 +64,7 @@ def main():
             if value <= 0: p.error(name+' must be positive')
             overrides[name] = value
     if any(v not in VARIANTS for v in overrides.get('variants', [])): p.error('Unknown variant')
-    table = ['# Generated matrix inventory', '', 'All rates are aggregate commands/s; times exclude setup and drain.', '',
+    table = ['# Generated matrix inventory', '', 'All rates are aggregate commands/s. Run counts and minimum hours include every selected version and repetition, plus warm-up, idle and the two-second post-drop observation; they exclude setup and drain.', '',
              '| Stage | Build mode | Runs | Measured seconds | Connections | Total in flight | Pipeline batch | Repeats | Minimum hours |',
              '| --- | --- | ---: | --- | --- | --- | --- | ---: | ---: |']
     for stage in args.stage or matrix['stages']:

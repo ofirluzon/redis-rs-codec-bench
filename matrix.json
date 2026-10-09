@@ -79,7 +79,7 @@
       "duration_s": 120,
       "warmup_s": 10,
       "idle_s": 10,
-      "repetitions": 1
+      "repetitions": 3
     },
     "main": {
       "connections": [
@@ -137,7 +137,7 @@
       "duration_s": 180,
       "warmup_s": 10,
       "idle_s": 60,
-      "repetitions": 1,
+      "repetitions": 3,
       "mode": "diagnostic"
     },
     "pipeline-screening": {
@@ -159,7 +159,7 @@
       "duration_s": 180,
       "warmup_s": 10,
       "idle_s": 30,
-      "repetitions": 1
+      "repetitions": 3
     },
     "synchronized-stress": {
       "connections": [
@@ -174,7 +174,7 @@
       "duration_s": 120,
       "warmup_s": 10,
       "idle_s": 30,
-      "repetitions": 1
+      "repetitions": 3
     },
     "jemalloc-screening": {
       "connections": [
@@ -192,7 +192,7 @@
       "duration_s": 120,
       "warmup_s": 10,
       "idle_s": 30,
-      "repetitions": 1,
+      "repetitions": 3,
       "mode": "jemalloc"
     },
     "confirmation": {

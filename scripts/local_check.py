@@ -57,6 +57,15 @@ def main():
                     assert summary['completed']==102, 'Tail pipeline command was lost in loopback'
                 assert summary['allocator']==('jemalloc' if args.jemalloc else 'system')
             subprocess.run(['python3',str(ROOT/'scripts/analyze.py'),str(scored)],check=True)
+            # Reports preserve individual cases and the validated total; local checks are one run per case.
+            import csv
+            for name in ['per_run.csv','means.csv','medians.csv','report.md','payload_report.md']:
+                assert (scored/name).stat().st_size>0
+            with (scored/'means.csv').open() as stream:
+                assert all(int(r['repetitions'])==1 for r in csv.DictReader(stream))
+            assert 'Validated runs: **12/12**' in (scored/'report.md').read_text()
+            assert 'INCOMPLETE' not in (scored/'report.md').read_text()
+            assert (scored/'kit/docs/METRICS.md').is_file()
             for diagnostic in ([False] if args.jemalloc else [False,True]):
                 for variant in ['baseline','patched-off','patched-on']:
                     binary='baseline' if variant=='baseline' else 'patched'
