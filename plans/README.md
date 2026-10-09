@@ -1,6 +1,6 @@
 # Generated matrix inventory
 
-All rates are aggregate commands/s; times exclude setup and drain.
+All rates are aggregate commands/s. Run counts and minimum hours include every selected version and repetition, plus warm-up, idle and the two-second post-drop observation; they exclude setup and drain.
 
 | Stage | Build mode | Runs | Measured seconds | Connections | Total in flight | Pipeline batch | Repeats | Minimum hours |
 | --- | --- | ---: | --- | --- | --- | --- | ---: | ---: |

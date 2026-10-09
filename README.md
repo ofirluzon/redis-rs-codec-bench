@@ -258,7 +258,9 @@ python3 scripts/make_plans.py --list
 
 Start with `plans/small-capacity-pilot.json`: six 30-second cases, one repetition.
 For the primary comparison, use `plans/main.json`: 135 five-minute cases, three
-repetitions, at least 13.57 hours. Each case is one version of one configuration.
+repetitions, at least 13.57 hours **including all three versions and repetitions**.
+That is 5 workload/rate combinations × 3 connection counts × 3 versions × 3
+repetitions = 135 cases. Each case is one version of one configuration.
 See [the inventory](plans/README.md) for the other stages and
 [matrix configuration](#configure-and-inspect-the-matrix) for shorter/custom plans.
 
