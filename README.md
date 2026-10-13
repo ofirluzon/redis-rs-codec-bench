@@ -5,8 +5,12 @@ async codec-buffer trimming enabled and disabled in redis-rs.
 
 **This is the follow-up harness, not the original harness that produced the earlier
 ten-minute results discussed in [redis-rs issue #2430](https://github.com/redis-rs/redis-rs/issues/2430).**
-The follow-up matrix has not run yet. Short correctness checks have passed; those
-checks are not performance results. Sources under comparison are pinned to
+The scored ARM comparison completed in October 2026: 270 five-minute runs across
+1/2/4/8/16/100 connections, three repetitions of baseline and patched-off/on.
+Measured results and experiment commentary remain private.
+[HTML report generation](docs/HTML_REPORTS.md) preserves the analysis tools and
+explains how to reproduce reports from the retained archive. Sources under
+comparison are pinned to
 [PR #2428](https://github.com/redis-rs/redis-rs/pull/2428) and its upstream base.
 
 The repository contains source, scripts, dependency pins and reproducible workload
@@ -49,8 +53,9 @@ Requirements: Rust 1.98.1, Python 3, Git, a C/C++ build toolchain, and a reachab
 Redis-compatible endpoint. An optional Linux bootstrap helper supports DNF and APT
 to install the toolchain and monitoring utilities. For other package managers,
 install equivalent packages. No setup/build should overlap measured traffic.
-Linux loopback CI validates telemetry and both allocators. The full performance
-matrix has not run yet.
+Linux loopback CI validates telemetry and both allocators. The scored main and
+intermediate-connection ARM matrices completed; optional diagnostic, pipeline,
+jemalloc and longer performance experiments have not run.
 
 Local checks cover builds, unit tests, all four workloads, explicit pipelines,
 single-spike probes, resume and connection failure. These checks validate correctness,
