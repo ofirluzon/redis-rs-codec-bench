@@ -14,3 +14,12 @@ __pycache__/
 *.key
 id_rsa*
 id_ed25519*
+
+# Derived reports and private archive directories
+/reports-output/
+/aws-export/
+/kit-snapshot/
+/analysis-runtime/
+/backup.log
+/backup.pid
+/interpretation/

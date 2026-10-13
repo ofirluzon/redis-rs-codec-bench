@@ -1,0 +1,15 @@
+{
+  "main": {
+    "per_run.csv": "3d50a3eac39c4b8580d7b3d910922a35cd0f28835cb3868e1bf5a7d9bc328ed0",
+    "means.csv": "a345cab45ead91ee95fdbfab7a325169b6316f7ccff31ff24804a0c51294c206",
+    "medians.csv": "8c7d62bc06f10bdb50533a0d526a9fb89f012531e60d7c0fa1f4038c0ceb2fe9"
+  },
+  "knee-validation": {
+    "per_run.csv": "5d976e8c82fef6e5fd5a68c470295d0bf7cd040b1f6d6882d4478156cf295d8b",
+    "means.csv": "17c73b4418577a20f292a5f756cc6bdc52b112a679ef7a4c29c2592a3530f54c",
+    "medians.csv": "620362f7946e3927802941b66b8565fa28475f4fb69879cf675a39ca0b79a0b9"
+  },
+  "small-capacity-pilot": {
+    "per_run.csv": "93dd3e244725dca69046003dea7066cb97f3ddf986301dba545a87480b07e993"
+  }
+}
